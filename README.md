@@ -1,53 +1,30 @@
-# Freda Ops Cockpit — Beta 0.2.32
+# Freda Ops Cockpit V33 - Uber Manager + WhatsApp Parser Fix
 
-This package keeps the 0.2.23 reporting.site busy-hours POST parser and adds forced Playwright/Chromium browser diagnostics for Render connection resets.
+This package is a targeted V33 overlay for the current Freda Ops Cockpit deployment.
 
-## Main purpose
+It fixes:
 
-Reporting.site may reset Render server-side requests with `ECONNRESET`. Beta 0.2.32 adds a browser-only POS sync, one-store diagnostics, and direct browser-runtime extraction for Busy Hours chart data so hourly rows can be recovered from rendered reporting.site pages.
+1. Uber Manager online sync false success where all three stores returned identical values, orders but zero sales, and no hourly rows.
+2. WhatsApp `.zip` parsing failure.
 
-## Render build
+It intentionally does not change POS/reporting.site logic.
 
-```text
-Root Directory: server
-Build Command: npm install && npx playwright install chromium
-Start Command: node server.js
-Health Check Path: /health
-```
-
-## Key endpoints
+## Files patched
 
 ```text
-/health
-/api/config/status
-/api/diagnostics/browser-sync
-/api/sync/pos/day-browser
-/api/sync/pos/day-browser-store
-/api/sync/pos/day
-/api/sync/pos/benchmarks
+server/src/connectors/uberConnector.js
+server/src/connectors/whatsappConnector.js
+server/src/whatsappParser.js
 ```
 
-## Notes
+## Why POS is not included
 
-- POS remains sync-first from reporting.site; uploaded POS files are backup only.
-- Uber, Frieda/Square and production still use uploaded files unless explicitly synced.
-- Do not commit real cookies, session IDs or API keys.
+The request was to keep POS as it is. For that reason this package only contains the Uber and WhatsApp files that need replacement. The current POS files should remain in the deployed repo.
 
-## Beta 0.2.32 notes
+## Install
 
-V30 is the first package where the front-end Sync POS buttons are wired to the working browser POS path. It also forces the selected reporting date using browser-context POST requests before falling back to normal page navigation. Stores are synced sequentially and saved after each store.
+See `docs/INSTALL_V33.md`.
 
-Render build command remains:
+## Changelog
 
-```bash
-npm install && npx playwright install chromium
-```
-
-## Beta 0.2.32
-
-Focus: Uber online sync and improved priority briefing.
-
-- POS sync parameters are unchanged from V31.
-- Uber no longer relies on the uploaded Excel workbook by default.
-- Use the new Uber online buttons in the app or the `/api/sync/uber/online` endpoints.
-- Priority messages now use sync gaps, product/category mix, and production plan vs sold-shape demand.
+See `docs/V33_CHANGELOG.md`.

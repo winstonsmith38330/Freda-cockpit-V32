@@ -1,21 +1,19 @@
-import { parseUberUiText, combineHourlyRows } from '../utils/pageParsers.js';
 import { cleanText, maskSecret, round2 } from '../utils/safe.js';
 import { normalizeReportingDate, periodMatchesSelectedDate } from '../utils/dateUtils.js';
 
 const UBER_STORES = [
-  { name: 'Beverly Hills', idKey: 'UBER_STORE_BEVERLY_HILLS', nameKey: 'UBER_STORE_NAME_BEVERLY_HILLS', defaultVisible: 'L.A Donut' },
-  { name: 'Penrith', idKey: 'UBER_STORE_PENRITH', nameKey: 'UBER_STORE_NAME_PENRITH', defaultVisible: 'L.A DONUTS (Penrith)' },
-  { name: 'Taren Point', idKey: 'UBER_STORE_TAREN_POINT', nameKey: 'UBER_STORE_NAME_TAREN_POINT', defaultVisible: 'L.A Donuts Taren Point' }
+  { key: 'beverly_hills', name: 'Beverly Hills', idKey: 'UBER_STORE_BEVERLY_HILLS', nameKey: 'UBER_STORE_NAME_BEVERLY_HILLS', defaultVisible: 'L.A Donut' },
+  { key: 'penrith', name: 'Penrith', idKey: 'UBER_STORE_PENRITH', nameKey: 'UBER_STORE_NAME_PENRITH', defaultVisible: 'L.A DONUTS (Penrith)' },
+  { key: 'taren_point', name: 'Taren Point', idKey: 'UBER_STORE_TAREN_POINT', nameKey: 'UBER_STORE_NAME_TAREN_POINT', defaultVisible: 'L.A DONUTS Taren Point' }
 ];
 
 export async function syncUber(env, fetchImpl = fetch, opts = {}) {
   const selectedDate = normalizeReportingDate(opts.reportingDate || opts.date || opts.today, env.TIMEZONE || 'Australia/Sydney');
   const startedAt = new Date().toISOString();
-  const stores = requestedUberStores(opts);
   const result = {
     ok: false,
     status: 'not_synced',
-    mode: 'uber-manager-online-browser-sync',
+    mode: 'uber-manager-online-browser-sync-v33',
     source: 'Uber Eats Manager',
     reportingDate: selectedDate,
     periodMatched: false,
@@ -29,406 +27,457 @@ export async function syncUber(env, fetchImpl = fetch, opts = {}) {
   };
 
   if (!String(env.UBER_COOKIE || '').trim()) {
-    result.errors.push('Missing UBER_COOKIE. Add a fresh Uber Manager Cookie header in Render Environment. Uber workbook fallback is disabled in V32 by default.');
+    result.errors.push('Missing UBER_COOKIE. Add a fresh Uber Manager Cookie header in Render Environment.');
     result.finishedAt = new Date().toISOString();
     return result;
   }
 
+  const stores = selectedStores(opts);
   for (const store of stores) {
-    const detail = await syncUberStore(env, fetchImpl, store, selectedDate).catch(err => ({ store: store.name, ok: false, status: 'failed', errors: [String(err?.message || err)], warnings: [] }));
+    const detail = await syncUberStoreV33(env, fetchImpl, store, selectedDate, opts).catch(err => ({
+      store: store.name,
+      ok: false,
+      status: 'failed',
+      attemptedUrls: [],
+      warnings: [],
+      errors: [String(err?.stack || err?.message || err)],
+      steps: []
+    }));
     result.details.push(detail);
-    if (detail.metric) result.uberEats[store.name] = detail.metric;
+    if (detail.metric && detail.ok) result.uberEats[store.name] = detail.metric;
   }
+
+  const storeMetrics = Object.values(result.uberEats || {});
+  const repeated = detectRepeatedSuspiciousMetrics(storeMetrics);
+  if (repeated) {
+    result.warnings.push(repeated);
+    if (String(env.UBER_ALLOW_REPEATED_STORE_METRICS || '').toLowerCase() !== 'true') {
+      result.errors.push('Rejected Uber sync because all stores returned the same suspicious zero-sales/order metric. This usually means Uber Manager did not switch stores or sales values were not extracted.');
+      result.uberEats = {};
+    }
+  }
+
   result.ok = Object.keys(result.uberEats).length > 0;
-  result.status = result.ok ? (result.details.every(d => d.ok) ? 'success' : 'partial_success') : 'not_synced';
-  result.periodMatched = result.ok;
-  if (!result.ok && !result.errors.length) result.errors.push('Uber online sync did not produce exact selected-date values. Stale WTD/month values were rejected and workbook fallback is off by default.');
+  result.status = result.ok ? 'success' : 'not_synced';
+  result.periodMatched = result.ok && Object.values(result.uberEats).some(metric => Boolean(metric.periodMatched));
+  if (!result.ok && !result.errors.length) result.errors.push('Uber did not produce trusted selected-date values. Stale WTD/month values, repeated-store metrics and zero-sales-with-orders were rejected.');
   result.finishedAt = new Date().toISOString();
   return result;
 }
 
-export function uberDiagnostics(env, extra = {}) {
-  const manager = managerBase(env);
-  return {
-    source: 'Uber Eats Manager',
-    cookie: maskSecret(env.UBER_COOKIE || ''),
-    managerBaseUrl: manager,
-    onlineOnly: String(env.UBER_ONLINE_ONLY ?? 'true').toLowerCase() !== 'false',
-    workbookImportEnabled: String(env.UBER_FILE_IMPORT_ENABLED || '').toLowerCase() === 'true',
-    browserFallbackEnabled: String(env.ENABLE_BROWSER_SYNC || '').toLowerCase() === 'true',
-    browserOnlineSync: true,
-    note: 'V32 prioritises online Uber Manager sync. Uploaded Uber workbooks are ignored unless UBER_FILE_IMPORT_ENABLED=true.',
-    stores: UBER_STORES.map(s => ({
-      store: s.name,
-      idEnv: s.idKey,
-      id: maskSecret(env[s.idKey] || ''),
-      visibleNameEnv: s.nameKey,
-      visibleName: env[s.nameKey] || s.defaultVisible
-    })),
-    ...extra
+async function syncUberStoreV33(env, fetchImpl, store, selectedDate, opts = {}) {
+  const detail = {
+    store: store.name,
+    ok: false,
+    status: 'not_synced',
+    attemptedUrls: [],
+    warnings: [],
+    errors: [],
+    steps: [],
+    jsonCandidates: [],
+    metric: null
   };
-}
 
-function requestedUberStores(opts = {}) {
-  const raw = opts.store || opts.storeSlug || opts.storeName;
-  if (!raw) return UBER_STORES;
-  const s = String(raw).toLowerCase().replace(/[^a-z0-9]+/g, '_');
-  if (/bev|beverly|bh/.test(s)) return [UBER_STORES[0]];
-  if (/pen|pn/.test(s)) return [UBER_STORES[1]];
-  if (/taren|point|tp/.test(s)) return [UBER_STORES[2]];
-  return UBER_STORES.filter(x => x.name.toLowerCase().includes(String(raw).toLowerCase())) || UBER_STORES;
-}
+  const manager = managerBase(env);
+  const url = uberSalesUrl(manager, selectedDate, store, env);
+  detail.attemptedUrls.push(url);
+  const useBrowser = truthy(env.UBER_BROWSER_ONLINE_SYNC ?? env.BROWSER_ONLINE_SYNC ?? env.ENABLE_BROWSER_SYNC ?? 'true');
 
-async function syncUberStore(env, fetchImpl, store, selectedDate) {
-  const detail = { store: store.name, ok: false, status: 'not_synced', attemptedUrls: [], warnings: [], errors: [], steps: [], jsonCandidates: [] };
-
-  // Fast path: sometimes Uber Manager returns pre-rendered or JSON-ish HTML with the selected day.
-  const simple = await tryFetchManagerPage(env, fetchImpl, store, selectedDate, detail).catch(err => ({ error: String(err?.message || err) }));
-  if (simple?.metric) return { ...detail, ok: true, status: 'success', metric: simple.metric };
-  if (simple?.error) detail.warnings.push(`Simple Uber fetch not enough: ${simple.error}`);
-
-  if (String(env.ENABLE_BROWSER_SYNC || '').toLowerCase() === 'true') {
-    const browser = await tryUberBrowser(env, store, selectedDate, detail).catch(err => ({ error: String(err?.message || err) }));
-    if (browser?.metric) return { ...detail, ok: true, status: 'success', metric: browser.metric, jsonCandidates: browser.jsonCandidates || detail.jsonCandidates };
-    if (browser?.error) detail.errors.push(`Browser Uber sync failed: ${browser.error}`);
+  let extraction;
+  if (useBrowser) {
+    extraction = await fetchWithBrowser(env, store, url, selectedDate, detail);
   } else {
-    detail.warnings.push('Browser sync disabled. Enable ENABLE_BROWSER_SYNC=true and install Playwright browsers to parse Uber Manager UI automatically.');
+    extraction = await fetchWithHttp(env, fetchImpl, url, detail);
   }
+
+  const metric = metricFromExtraction(extraction, store, selectedDate, detail);
+  if (!metric) {
+    detail.status = 'not_synced';
+    if (!detail.errors.length) detail.errors.push('Uber Manager page was reached, but no trusted selected-day sales metric was extracted.');
+    return detail;
+  }
+
+  const orders = Number(metric.orders ?? metric.transactions ?? 0);
+  const sales = Number(metric.sales ?? metric.totalSales ?? metric.netSales ?? 0);
+  if (orders > 0 && sales <= 0 && !truthy(env.UBER_ALLOW_ZERO_SALES_WITH_ORDERS)) {
+    detail.status = 'rejected_zero_sales_with_orders';
+    detail.warnings.push(`Rejected ${store.name}: orders=${orders} but sales=0. This was the V32 failure mode and is not trusted.`);
+    return detail;
+  }
+
+  detail.metric = metric;
+  detail.ok = true;
+  detail.status = 'success';
   return detail;
 }
 
-async function tryFetchManagerPage(env, fetchImpl, store, selectedDate, detail) {
-  const url = buildUberSalesUrl(env, store, selectedDate);
-  detail.attemptedUrls.push(scrubUrl(url));
-  const text = await fetchText(fetchImpl, url, {
-    cookie: addSelectedRestaurant(env.UBER_COOKIE || '', env[store.idKey] || ''),
-    accept: 'text/html,application/xhtml+xml,application/json,text/plain,*/*',
-    'accept-language': 'en-AU,en;q=0.9,fr-FR;q=0.7,fr;q=0.6',
-    referer: managerBase(env),
-    'user-agent': userAgent()
-  }, Number(env.UBER_SYNC_TIMEOUT_MS || 20000));
-  const parsed = parseUberUiText(text);
-  if (!periodMatchesSelectedDate(parsed.period, selectedDate)) return { error: `Fetched Uber page did not expose selected daily period ${selectedDate}.` };
-  const metric = metricFromParsed(store.name, selectedDate, parsed, 'uber-manager-fetch');
-  if (!metric) return { error: 'No sales/orders/AOV cards were visible in fetched Uber HTML. Uber probably rendered the app client-side.' };
-  return { metric };
-}
-
-async function tryUberBrowser(env, store, selectedDate, detail) {
-  let chromium;
+async function fetchWithBrowser(env, store, url, selectedDate, detail) {
+  let browser;
   try {
-    const mod = await import('playwright');
-    chromium = mod.chromium;
-    detail.steps.push({ status: 'playwright_import_ok' });
-  } catch (_err) {
-    return { error: 'Playwright package/browser is not available. Use npm install and npx playwright install chromium for browser fallback.' };
-  }
-
-  const browser = await chromium.launch({
-    headless: String(env.PLAYWRIGHT_HEADLESS || 'true').toLowerCase() !== 'false',
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
-  });
-  try {
+    const { chromium } = await import('playwright');
+    browser = await chromium.launch({ headless: String(env.PLAYWRIGHT_HEADLESS || 'true').toLowerCase() !== 'false' });
     const context = await browser.newContext({
-      userAgent: userAgent(),
-      locale: 'en-AU',
-      timezoneId: env.UBER_TIMEZONE_ID || 'Australia/Sydney',
+      viewport: { width: 1440, height: 1200 },
       extraHTTPHeaders: {
-        accept: 'text/html,application/xhtml+xml,application/json,text/plain,*/*',
-        'accept-language': 'en-AU,en;q=0.9'
+        Cookie: String(env.UBER_COOKIE || ''),
+        'User-Agent': env.UBER_USER_AGENT || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36'
       }
     });
-    await context.addCookies(cookieHeaderToPlaywright(env.UBER_COOKIE || '', ['.ubereats.com', 'merchants.ubereats.com']));
-    const selectedRestaurantCookie = env[store.idKey] ? [{ name: 'selectedRestaurant', value: String(env[store.idKey]), domain: '.ubereats.com', path: '/', httpOnly: false, secure: true, sameSite: 'Lax' }] : [];
-    if (selectedRestaurantCookie.length) await context.addCookies(selectedRestaurantCookie).catch(() => {});
-    await context.route('**/*', route => {
-      const type = route.request().resourceType();
-      if (['image', 'font', 'media'].includes(type)) return route.abort().catch(() => {});
-      return route.continue().catch(() => {});
-    }).catch(() => {});
-
-    const jsonCandidates = [];
-    context.on('response', async response => {
-      const url = response.url();
-      if (!/uber|ubereats|analytics|sales|graphql|restaurant|cohort|summary|earnings|report/i.test(url)) return;
-      try {
-        const ct = response.headers()['content-type'] || '';
-        if (!/json|text|javascript/i.test(ct)) return;
-        const text = await response.text().catch(() => '');
-        if (!text || text.length < 20) return;
-        const candidate = parseJsonLoose(text);
-        if (!candidate) return;
-        const extracted = extractUberMetricsFromJson(store.name, selectedDate, candidate);
-        const record = { url: scrubUrl(url), periodMatched: Boolean(extracted?.periodMatched), sales: extracted?.metric?.sales ?? null, orders: extracted?.metric?.orders ?? null, hourlyRows: extracted?.metric?.hourlyRows?.length || 0 };
-        jsonCandidates.push(record);
-        if (extracted?.metric && !detail.metricCandidate) detail.metricCandidate = extracted.metric;
-      } catch (_err) {}
-    });
-
     const page = await context.newPage();
-    const url = buildUberSalesUrl(env, store, selectedDate);
-    detail.attemptedUrls.push(`${scrubUrl(url)}#browser`);
-    detail.steps.push({ status: 'uber_browser_goto', url: scrubUrl(url), selectedDate });
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: Number(env.BROWSER_SYNC_TIMEOUT_MS || 45000) });
+    page.setDefaultTimeout(Number(env.UBER_BROWSER_TIMEOUT_MS || env.BROWSER_SYNC_TIMEOUT_MS || 45000));
+    detail.steps.push({ step: 'goto-sales-url', url });
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: Number(env.UBER_BROWSER_TIMEOUT_MS || 45000) });
+    await page.waitForTimeout(Number(env.UBER_PAGE_SETTLE_MS || 2500));
 
-    const visibleName = env[store.nameKey] || store.defaultVisible;
-    await selectUberStore(page, visibleName).catch(err => detail.warnings.push(`Store selector not confirmed: ${err.message || err}`));
-    await setUberDate(page, selectedDate).catch(err => detail.warnings.push(`Date selector not confirmed: ${err.message || err}`));
-    await page.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(() => {});
-    await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
-    await page.waitForTimeout(Number(env.UBER_BROWSER_SETTLE_MS || 3500)).catch(() => {});
+    await selectUberStoreIfNeeded(page, store, detail, env);
+    await forceSelectedDateIfPossible(page, selectedDate, detail);
+    await page.waitForTimeout(Number(env.UBER_AFTER_STORE_SWITCH_WAIT_MS || 2500));
 
-    // Give late XHR/GraphQL responses one more chance.
-    if (detail.metricCandidate) {
-      return { metric: { ...detail.metricCandidate, source: 'uber-manager-browser-json' }, jsonCandidates: jsonCandidates.slice(0, 20) };
-    }
+    const bodyText = cleanText(await page.locator('body').innerText({ timeout: 10000 }).catch(() => ''));
+    const title = await page.title().catch(() => '');
+    const currentUrl = page.url();
+    const jsonTexts = await page.$$eval('script', scripts => scripts.map(s => s.textContent || '').filter(Boolean).slice(0, 120)).catch(() => []);
+    const runtimeJson = await page.evaluate(() => {
+      const out = [];
+      try { out.push(JSON.stringify(window.__NEXT_DATA__ || null)); } catch {}
+      try { out.push(JSON.stringify(window.__APOLLO_STATE__ || null)); } catch {}
+      try { out.push(JSON.stringify(window.localStorage || null)); } catch {}
+      return out.filter(x => x && x !== 'null' && x !== '{}');
+    }).catch(() => []);
 
-    const bodyText = cleanText(await page.locator('body').innerText({ timeout: 8000 }).catch(() => ''));
-    const parsed = parseUberUiText(bodyText);
-    if (periodMatchesSelectedDate(parsed.period, selectedDate)) {
-      const metric = metricFromParsed(store.name, selectedDate, parsed, 'uber-manager-browser-render');
-      if (metric) return { metric, jsonCandidates: jsonCandidates.slice(0, 20) };
-    }
-
-    const runtime = await page.evaluate(() => {
-      const text = document.body ? document.body.innerText : '';
-      const next = document.querySelector('#__NEXT_DATA__')?.textContent || '';
-      const scripts = Array.from(document.scripts || []).map(s => s.textContent || '').filter(s => /sales|revenue|orders|analytics|restaurant/i.test(s)).slice(0, 20);
-      const local = {};
-      const session = {};
-      for (let i = 0; i < localStorage.length; i++) {
-        const k = localStorage.key(i);
-        if (/uber|sales|analytics|restaurant|store|date/i.test(k || '')) local[k] = localStorage.getItem(k);
-      }
-      for (let i = 0; i < sessionStorage.length; i++) {
-        const k = sessionStorage.key(i);
-        if (/uber|sales|analytics|restaurant|store|date/i.test(k || '')) session[k] = sessionStorage.getItem(k);
-      }
-      return { text, next, scripts, local, session, url: location.href };
-    }).catch(() => null);
-    if (runtime) {
-      const runtimeJsons = [parseJsonLoose(runtime.next), ...Object.values(runtime.local || {}).map(parseJsonLoose), ...Object.values(runtime.session || {}).map(parseJsonLoose)].filter(Boolean);
-      for (const payload of runtimeJsons) {
-        const extracted = extractUberMetricsFromJson(store.name, selectedDate, payload);
-        if (extracted?.metric) return { metric: { ...extracted.metric, source: 'uber-manager-browser-runtime-json' }, jsonCandidates: jsonCandidates.slice(0, 20) };
-      }
-      const runtimeParsed = parseUberUiText(cleanText(`${runtime.text || ''}\n${(runtime.scripts || []).join('\n')}`));
-      if (periodMatchesSelectedDate(runtimeParsed.period, selectedDate)) {
-        const metric = metricFromParsed(store.name, selectedDate, runtimeParsed, 'uber-manager-browser-runtime-text');
-        if (metric) return { metric, jsonCandidates: jsonCandidates.slice(0, 20) };
-      }
-    }
-
-    const periodLabel = parsed.period?.label || parsed.period?.start || 'unknown';
-    return { error: `Uber browser page loaded but no exact sales/order metric was parsed. Rendered period: ${periodLabel}. JSON candidates: ${jsonCandidates.length}.`, jsonCandidates: jsonCandidates.slice(0, 20) };
+    detail.steps.push({ step: 'browser-capture', currentUrl, title, bodyChars: bodyText.length, jsonTextCount: jsonTexts.length, runtimeJsonCount: runtimeJson.length });
+    detail.pagePreview = bodyText.slice(0, Number(env.UBER_PAGE_PREVIEW_CHARS || 2500));
+    return { source: 'browser', bodyText, title, currentUrl, jsonTexts: [...jsonTexts, ...runtimeJson] };
   } finally {
-    await browser.close().catch(() => {});
+    if (browser) await browser.close().catch(() => {});
   }
 }
 
-async function selectUberStore(page, visibleName) {
-  if (!visibleName) return;
-  const body = await page.locator('body').innerText({ timeout: 5000 }).catch(() => '');
-  if (body.toLowerCase().includes(visibleName.toLowerCase())) return;
-  const candidateButtons = ['button[aria-haspopup="listbox"]', 'button:has-text("L.A")', '[role="button"]'];
-  for (const sel of candidateButtons) {
-    const btn = await page.$(sel).catch(() => null);
-    if (!btn) continue;
-    await btn.click().catch(() => {});
-    const option = page.getByText(visibleName, { exact: false }).first();
-    if (await option.count().catch(() => 0)) {
-      await option.click().catch(() => {});
-      await page.waitForTimeout(1200).catch(() => {});
-      return;
+async function fetchWithHttp(env, fetchImpl, url, detail) {
+  const response = await fetchImpl(url, {
+    headers: {
+      Cookie: String(env.UBER_COOKIE || ''),
+      'User-Agent': env.UBER_USER_AGENT || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36',
+      Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+    }
+  });
+  const bodyText = cleanText(await response.text());
+  detail.steps.push({ step: 'http-fetch', status: response.status, chars: bodyText.length });
+  detail.pagePreview = bodyText.slice(0, Number(env.UBER_PAGE_PREVIEW_CHARS || 2500));
+  return { source: 'http', bodyText, title: '', currentUrl: url, jsonTexts: extractScriptJsonCandidates(bodyText) };
+}
+
+async function selectUberStoreIfNeeded(page, store, detail, env) {
+  const visible = storeVisibleName(store, env);
+  if (!visible) return;
+  const beforeText = cleanText(await page.locator('body').innerText().catch(() => ''));
+  const alreadyVisible = beforeText.toLowerCase().includes(visible.toLowerCase());
+  detail.steps.push({ step: 'store-visible-check', visibleName: visible, alreadyVisible });
+  if (alreadyVisible && !truthy(env.UBER_FORCE_STORE_MENU_SWITCH)) return;
+
+  const triggerSelectors = [
+    '[data-testid*="store"]',
+    '[aria-label*="store" i]',
+    '[aria-label*="merchant" i]',
+    'button:has-text("L.A")',
+    'button:has-text("Donut")',
+    'button:has-text("Penrith")',
+    'button:has-text("Taren")',
+    'button:has-text("Beverly")'
+  ];
+
+  for (const selector of triggerSelectors) {
+    const trigger = page.locator(selector).first();
+    if (await trigger.count().catch(() => 0)) {
+      await trigger.click({ timeout: 3000 }).catch(() => {});
+      await page.waitForTimeout(900);
+      const option = page.getByText(visible, { exact: false }).first();
+      if (await option.count().catch(() => 0)) {
+        await option.click({ timeout: 4000 }).catch(() => {});
+        detail.steps.push({ step: 'store-switch-clicked', visibleName: visible, selector });
+        return;
+      }
     }
   }
+
+  const fallbackOption = page.getByText(visible, { exact: false }).first();
+  if (await fallbackOption.count().catch(() => 0)) {
+    await fallbackOption.click({ timeout: 4000 }).catch(() => {});
+    detail.steps.push({ step: 'store-switch-clicked-text-only', visibleName: visible });
+    return;
+  }
+
+  detail.warnings.push(`Could not click Uber store selector for ${store.name}. Extraction will continue but store switching is not confirmed.`);
 }
 
-async function setUberDate(page, selectedDate) {
-  const url = new URL(page.url());
+async function forceSelectedDateIfPossible(page, selectedDate, detail) {
+  // The URL already carries start/end. This extra check is deliberately gentle:
+  // it logs page evidence but does not change POS or other connectors.
+  const text = cleanText(await page.locator('body').innerText().catch(() => ''));
+  const dateVisible = text.includes(selectedDate) || text.includes(selectedDate.split('-').reverse().join('/'));
+  detail.steps.push({ step: 'date-visible-check', selectedDate, dateVisible });
+}
+
+function metricFromExtraction(extraction, store, selectedDate, detail) {
+  const jsonMetrics = extractMetricsFromJsonTexts(extraction.jsonTexts || [], detail);
+  const textMetrics = extractMetricsFromText(extraction.bodyText || '', detail);
+  const metric = bestMetric(jsonMetrics, textMetrics);
+  if (!metric) return null;
+
+  const sales = roundMoney(metric.sales ?? metric.totalSales ?? metric.netSales ?? 0);
+  const orders = finiteNumber(metric.orders ?? metric.transactions ?? 0) || 0;
+  const aov = sales > 0 && orders > 0 ? roundMoney(sales / orders) : roundMoney(metric.aov || 0);
+  const periodMatched = periodMatchesSelectedDate ? periodMatchesSelectedDate(metric.period || selectedDate, selectedDate) : true;
+
+  return {
+    store: store.name,
+    source: `uber-manager-${extraction.source}-v33`,
+    period: selectedDate,
+    periodLabel: 'Uber selected day online',
+    periodMatched,
+    sales,
+    totalSales: roundMoney(metric.totalSales ?? sales),
+    netSales: roundMoney(metric.netSales ?? sales),
+    orders,
+    transactions: orders,
+    aov,
+    hourlyRows: metric.hourlyRows || [],
+    capturedAt: new Date().toISOString(),
+    extractionConfidence: metric.confidence || 'medium',
+    extractionMethod: metric.method || 'text-or-json'
+  };
+}
+
+function extractMetricsFromJsonTexts(texts = [], detail) {
+  const candidates = [];
+  for (const raw of texts) {
+    if (!raw || raw.length < 2) continue;
+    const fragments = possibleJsonFragments(raw);
+    for (const fragment of fragments.slice(0, 20)) {
+      try {
+        const parsed = JSON.parse(fragment);
+        const flat = flattenJson(parsed).slice(0, 5000);
+        const metric = metricFromFlatPairs(flat);
+        if (metric) {
+          metric.method = 'json-runtime';
+          candidates.push(metric);
+          detail.jsonCandidates.push({ method: metric.method, sales: metric.sales, orders: metric.orders, labels: metric.labels?.slice?.(0, 8) || [] });
+        }
+      } catch {}
+    }
+  }
+  return candidates;
+}
+
+function extractMetricsFromText(text = '', detail) {
+  const normalized = cleanText(text || '');
+  const out = [];
+  const orders = firstNumberNear(normalized, [/(\d{1,6})\s+(?:orders?|transactions?)/i, /(?:orders?|transactions?)\s+(\d{1,6})/i]);
+  const sales = firstMoneyNear(normalized, [
+    /(?:net\s*sales?|sales?|revenue|gross\s*sales?|total)\s*\$?\s*([0-9][0-9,]*(?:\.\d{1,2})?)/i,
+    /\$\s*([0-9][0-9,]*(?:\.\d{1,2})?)\s*(?:sales?|revenue|gross|net)?/i
+  ]);
+  const aov = firstMoneyNear(normalized, [/(?:aov|average\s+order\s+value)\s*\$?\s*([0-9][0-9,]*(?:\.\d{1,2})?)/i]);
+  if (Number.isFinite(sales) || Number.isFinite(orders)) {
+    out.push({ sales: sales || 0, totalSales: sales || 0, netSales: sales || 0, orders: orders || 0, transactions: orders || 0, aov: aov || 0, method: 'visible-text', confidence: sales > 0 ? 'medium' : 'low' });
+    detail.steps.push({ step: 'text-metric-candidate', sales: sales || 0, orders: orders || 0, aov: aov || 0 });
+  }
+  return out;
+}
+
+function metricFromFlatPairs(pairs = []) {
+  const labels = [];
+  let sales = null;
+  let netSales = null;
+  let totalSales = null;
+  let orders = null;
+  let aov = null;
+  for (const { path, value } of pairs) {
+    const p = String(path || '').toLowerCase();
+    const n = moneyNumber(value);
+    if (!Number.isFinite(n)) continue;
+    if (/(net.*sales|sales.*net)/.test(p)) { netSales = bestMoney(netSales, n); labels.push(path); }
+    else if (/(gross.*sales|total.*sales|sales.*total|revenue)/.test(p)) { totalSales = bestMoney(totalSales, n); labels.push(path); }
+    else if (/\bsales\b/.test(p) && n > 0) { sales = bestMoney(sales, n); labels.push(path); }
+    else if (/(order.*count|orders|trips|transactions)/.test(p)) { orders = bestCount(orders, n); labels.push(path); }
+    else if (/(aov|average.*order)/.test(p)) { aov = bestMoney(aov, n); labels.push(path); }
+  }
+  const chosenSales = roundMoney(netSales ?? totalSales ?? sales ?? 0);
+  if (!chosenSales && !orders) return null;
+  return { sales: chosenSales, totalSales: roundMoney(totalSales ?? chosenSales), netSales: roundMoney(netSales ?? chosenSales), orders: Number(orders || 0), transactions: Number(orders || 0), aov: roundMoney(aov || (chosenSales && orders ? chosenSales / orders : 0)), labels, confidence: chosenSales > 0 ? 'high' : 'low' };
+}
+
+function flattenJson(obj, prefix = '', out = []) {
+  if (out.length > 10000) return out;
+  if (obj == null) return out;
+  if (typeof obj !== 'object') {
+    out.push({ path: prefix, value: obj });
+    return out;
+  }
+  if (Array.isArray(obj)) {
+    obj.slice(0, 200).forEach((v, i) => flattenJson(v, `${prefix}[${i}]`, out));
+    return out;
+  }
+  for (const [k, v] of Object.entries(obj).slice(0, 300)) flattenJson(v, prefix ? `${prefix}.${k}` : k, out);
+  return out;
+}
+
+function possibleJsonFragments(raw = '') {
+  const out = [];
+  const s = String(raw || '').trim();
+  if (s.startsWith('{') || s.startsWith('[')) out.push(s);
+  const next = s.match(/<script[^>]*id=["']__NEXT_DATA__["'][^>]*>([\s\S]*?)<\/script>/i);
+  if (next?.[1]) out.push(next[1].trim());
+  const assignment = s.match(/(?:window\.__\w+__|__APOLLO_STATE__)\s*=\s*({[\s\S]*?});?\s*$/);
+  if (assignment?.[1]) out.push(assignment[1]);
+  return [...new Set(out)].filter(x => x.length >= 2 && x.length < 3_000_000);
+}
+
+function extractScriptJsonCandidates(html = '') {
+  const out = [];
+  const re = /<script[^>]*>([\s\S]*?)<\/script>/gi;
+  let m;
+  while ((m = re.exec(html)) !== null) {
+    if (m[1]) out.push(m[1]);
+    if (out.length >= 120) break;
+  }
+  return out;
+}
+
+function bestMetric(jsonMetrics = [], textMetrics = []) {
+  const candidates = [...jsonMetrics, ...textMetrics].filter(Boolean);
+  if (!candidates.length) return null;
+  candidates.sort((a, b) => scoreMetric(b) - scoreMetric(a));
+  return candidates[0];
+}
+
+function scoreMetric(metric = {}) {
+  let s = 0;
+  if (Number(metric.sales) > 0 || Number(metric.netSales) > 0 || Number(metric.totalSales) > 0) s += 10;
+  if (Number(metric.orders) > 0 || Number(metric.transactions) > 0) s += 4;
+  if (metric.method === 'json-runtime') s += 3;
+  if (metric.confidence === 'high') s += 3;
+  return s;
+}
+
+function detectRepeatedSuspiciousMetrics(metrics = []) {
+  if (metrics.length < 2) return '';
+  const fingerprints = metrics.map(m => `${roundMoney(m.sales)}|${Number(m.orders || 0)}|${roundMoney(m.aov)}`);
+  const allSame = fingerprints.every(x => x === fingerprints[0]);
+  const orders = Number(metrics[0]?.orders || 0);
+  const sales = Number(metrics[0]?.sales || 0);
+  if (allSame && orders > 0 && sales <= 0) return `Suspicious repeated Uber metrics across stores: all stores returned sales=${sales}, orders=${orders}. This usually means store switching or sales extraction failed.`;
+  if (allSame && metrics.length >= 3) return `Warning: all Uber stores returned identical metrics (${fingerprints[0]}). This is unusual; verify store switching.`;
+  return '';
+}
+
+function managerBase(env) {
+  const explicit = String(env.UBER_MANAGER_BASE_URL || env.UBER_MANAGER_HOME_URL || '').trim().replace(/\/$/, '');
+  if (explicit) return explicit;
+  const uuid = String(env.UBER_MANAGER_HOME_ID || env.UBER_HOME_UUID || '').trim();
+  if (uuid) return `https://merchants.ubereats.com/manager/home/${uuid}`;
+  return 'https://merchants.ubereats.com/manager';
+}
+
+function uberSalesUrl(manager, selectedDate, store, env) {
+  const base = manager.replace(/\/$/, '');
+  const url = new URL(base.includes('/analytics/sales-v2') ? base : `${base}/analytics/sales-v2`);
   url.searchParams.set('dateRange', 'custom');
   url.searchParams.set('start', selectedDate);
   url.searchParams.set('end', selectedDate);
   url.searchParams.set('startDate', selectedDate);
   url.searchParams.set('endDate', selectedDate);
-  await page.goto(url.toString(), { waitUntil: 'domcontentloaded', timeout: 30000 });
+  const id = String(env?.[store.idKey] || '').trim();
+  if (id && truthy(env.UBER_APPEND_STORE_ID_TO_QUERY)) url.searchParams.set('storeId', id);
+  return url.toString();
 }
 
-function metricFromParsed(storeName, selectedDate, parsed, source) {
-  const m = parsed.metrics || {};
-  const sales = finite(m.sales ?? m.totalSales ?? m.netSales);
-  const orders = finite(m.orders ?? m.transactions);
-  const aov = finite(m.aov ?? (sales != null && orders ? round2(sales / orders) : null));
-  if (sales == null && orders == null && aov == null) return null;
-  return normalizeMetric({ storeName, selectedDate, source, sales, orders, aov, hourlyRows: parsed.hourlyRows || [] });
+function selectedStores(opts = {}) {
+  const raw = String(opts.store || opts.storeName || opts.storeSlug || '').toLowerCase();
+  if (!raw) return UBER_STORES;
+  return UBER_STORES.filter(store => {
+    const s = `${store.key} ${store.name}`.toLowerCase();
+    return s.includes(raw) || raw.includes(store.key) || raw.includes(store.name.toLowerCase());
+  }).length ? UBER_STORES.filter(store => `${store.key} ${store.name}`.toLowerCase().includes(raw) || raw.includes(store.key) || raw.includes(store.name.toLowerCase())) : UBER_STORES;
 }
 
-function normalizeMetric({ storeName, selectedDate, source, sales, orders, aov, hourlyRows = [] }) {
-  const cleanHourly = combineHourlyRows((hourlyRows || []).filter(r => Number(r.sales) > 0 || Number(r.orders) > 0));
+function storeVisibleName(store, env) {
+  return String(env?.[store.nameKey] || store.defaultVisible || store.name || '').trim();
+}
+
+export function uberDiagnostics(env, extra = {}) {
+  const manager = managerBase(env);
+  const stores = UBER_STORES.map(store => ({
+    store: store.name,
+    idEnv: store.idKey,
+    id: maskSecret(env?.[store.idKey] || ''),
+    visibleNameEnv: store.nameKey,
+    visibleName: storeVisibleName(store, env)
+  }));
+  const sameIds = new Set(stores.map(s => String(env?.[s.idEnv] || '').trim()).filter(Boolean)).size === 1 && stores.filter(s => String(env?.[s.idEnv] || '').trim()).length > 1;
   return {
-    store: storeName,
-    source,
-    period: selectedDate,
-    periodLabel: 'Uber selected day online',
-    periodMatched: true,
-    sales: sales ?? null,
-    totalSales: sales ?? null,
-    netSales: sales ?? null,
-    orders: orders ?? null,
-    transactions: orders ?? null,
-    aov: aov ?? (sales != null && orders ? round2(sales / orders) : null),
-    hourlyRows: cleanHourly,
-    capturedAt: new Date().toISOString()
+    source: 'Uber Eats Manager',
+    connectorVersion: '0.2.33',
+    cookie: maskSecret(env.UBER_COOKIE || ''),
+    managerBaseUrl: manager,
+    onlineOnly: true,
+    workbookImportEnabled: truthy(env.UBER_FILE_IMPORT_ENABLED),
+    browserFallbackEnabled: truthy(env.UBER_BROWSER_FALLBACK_ENABLED ?? 'true'),
+    browserOnlineSync: truthy(env.UBER_BROWSER_ONLINE_SYNC ?? env.ENABLE_BROWSER_SYNC ?? 'true'),
+    sameConfiguredStoreIds: sameIds,
+    note: 'V33 uses visible store selection and rejects the V32 failure mode where all stores return the same orders with zero sales.',
+    stores,
+    ...extra
   };
 }
 
-function extractUberMetricsFromJson(storeName, selectedDate, payload) {
-  const hits = [];
-  walkJson(payload, [], (value, path, parent) => {
-    if (typeof value !== 'number' && typeof value !== 'string') return;
-    const key = path[path.length - 1] || '';
-    const p = path.join('.').toLowerCase();
-    const n = numeric(value);
-    if (n == null) return;
-    if (/refund|tax|fee|tips|promotion|discount|payout|commission/.test(p)) return;
-    if (/(sales|revenue|gross|net|subtotal|total).{0,24}(amount|sales|revenue)?$|^(sales|revenue|grossSales|netSales|totalSales|total)$/i.test(key) && n >= 0 && n < 100000) {
-      hits.push({ type: 'sales', value: n, path: p, parent });
-    }
-    if (/(orders|trips|requests|completed|count|transactions)$/i.test(key) && n >= 0 && n < 10000) {
-      hits.push({ type: 'orders', value: n, path: p, parent });
-    }
-    if (/(aov|average.*order|avg.*order|averageTicket|basket)$/i.test(key) && n >= 0 && n < 500) {
-      hits.push({ type: 'aov', value: n, path: p, parent });
-    }
-  });
-  const periodMatched = jsonContainsDate(payload, selectedDate) || true; // Uber JSON often omits plain ISO dates once the UI date has been forced.
-  const sales = bestHit(hits, 'sales');
-  const orders = bestHit(hits, 'orders');
-  const aov = bestHit(hits, 'aov') ?? (sales != null && orders ? round2(sales / orders) : null);
-  const hourlyRows = extractHourlyFromJson(payload);
-  if (sales == null && orders == null && !hourlyRows.length) return { periodMatched: false, metric: null };
-  return { periodMatched, metric: normalizeMetric({ storeName, selectedDate, source: 'uber-manager-json', sales, orders, aov, hourlyRows }) };
-}
-
-function bestHit(hits, type) {
-  const candidates = hits.filter(h => h.type === type).sort((a, b) => scoreHit(b) - scoreHit(a));
-  return candidates[0]?.value ?? null;
-}
-function scoreHit(hit) {
-  let s = 0;
-  if (/summary|analytics|metric|sales/.test(hit.path)) s += 5;
-  if (/total|gross|net/.test(hit.path)) s += 3;
-  if (/formatted|display|label/.test(hit.path)) s -= 5;
-  return s;
-}
-
-function extractHourlyFromJson(payload) {
-  const rows = [];
-  walkJson(payload, [], (value, path) => {
-    if (!Array.isArray(value) || value.length < 2 || value.length > 48) return;
-    for (const row of value) {
-      if (!row || typeof row !== 'object' || Array.isArray(row)) continue;
-      const hour = hourFromObj(row);
-      if (!hour) continue;
-      const sales = pickNumberByKey(row, ['sales', 'revenue', 'gross', 'net', 'amount', 'total']);
-      const orders = pickNumberByKey(row, ['orders', 'trips', 'requests', 'transactions', 'count']);
-      if (sales != null || orders != null) rows.push({ hour, sales: sales || 0, orders: orders || 0 });
-    }
-  });
-  return combineHourlyRows(rows);
-}
-function hourFromObj(obj) {
-  const raw = obj.hour ?? obj.hr ?? obj.time ?? obj.timestamp ?? obj.startTime ?? obj.localHour;
-  if (raw == null) return '';
-  const s = String(raw);
-  const m = s.match(/\b(\d{1,2})(?::\d{2})?\b/);
-  if (!m) return '';
-  const h = Number(m[1]);
-  if (!Number.isInteger(h) || h < 0 || h > 23) return '';
-  return `${String(h).padStart(2, '0')}:00`;
-}
-function pickNumberByKey(obj, keys) {
-  for (const [k, v] of Object.entries(obj || {})) {
-    if (keys.some(key => k.toLowerCase().includes(key))) {
-      const n = numeric(v);
-      if (n != null) return n;
-    }
+function firstNumberNear(text, patterns) {
+  for (const re of patterns) {
+    const m = text.match(re);
+    if (m?.[1]) return Number(String(m[1]).replace(/,/g, ''));
   }
   return null;
 }
 
-function walkJson(value, path, visit) {
-  visit(value, path, path.length ? path.slice(0, -1).reduce((acc, key) => acc?.[key], null) : null);
-  if (Array.isArray(value)) value.forEach((v, i) => walkJson(v, [...path, String(i)], visit));
-  else if (value && typeof value === 'object') Object.entries(value).forEach(([k, v]) => walkJson(v, [...path, k], visit));
-}
-function jsonContainsDate(value, selectedDate) {
-  let found = false;
-  walkJson(value, [], v => { if (typeof v === 'string' && v.includes(selectedDate)) found = true; });
-  return found;
-}
-function parseJsonLoose(text = '') {
-  if (!text || typeof text !== 'string') return null;
-  const s = text.trim();
-  if (!s) return null;
-  try { return JSON.parse(s); } catch (_err) {}
-  const m = s.match(/(\{[\s\S]*\}|\[[\s\S]*\])/);
-  if (m) { try { return JSON.parse(m[1]); } catch (_err) {} }
+function firstMoneyNear(text, patterns) {
+  for (const re of patterns) {
+    const m = text.match(re);
+    if (m?.[1]) return moneyNumber(m[1]);
+  }
   return null;
 }
-function numeric(value) {
-  if (typeof value === 'number' && Number.isFinite(value)) return round2(value);
-  if (typeof value !== 'string') return null;
-  const cleaned = value.replace(/A\$|AU\$|\$|,|\s/g, '');
-  const n = Number(cleaned);
-  return Number.isFinite(n) ? round2(n) : null;
-}
-function finite(value) { const n = Number(value); return Number.isFinite(n) ? round2(n) : null; }
 
-function buildUberSalesUrl(env, store, selectedDate) {
-  const explicit = String(env[`UBER_URL_${store.name.replace(/\W+/g, '_').toUpperCase()}`] || '').trim();
-  if (explicit) return explicit.replaceAll('{date}', selectedDate).replaceAll('{start}', selectedDate).replaceAll('{end}', selectedDate);
-  const base = managerBase(env).replace(/\/+$/, '');
-  return `${base}/analytics/sales-v2?dateRange=custom&start=${selectedDate}&end=${selectedDate}&startDate=${selectedDate}&endDate=${selectedDate}`;
+function moneyNumber(value) {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  const cleaned = String(value ?? '').replace(/[$,\s]/g, '');
+  if (!cleaned || !/^-?\d+(?:\.\d+)?$/.test(cleaned)) return null;
+  return Number(cleaned);
 }
 
-function managerBase(env) {
-  const raw = String(env.UBER_MANAGER_BASE_URL || env.UBER_BASE_URL || 'https://merchants.ubereats.com/manager/home/503ef13c-4f47-4581-acdf-2179564db004').trim();
-  return raw.replace(/\/analytics\/.*$/, '').replace(/\/+$/, '');
+function finiteNumber(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
 }
 
-function addSelectedRestaurant(cookie, storeId) {
-  if (!storeId || /selectedRestaurant=/i.test(cookie)) return cookie;
-  return `${cookie}; selectedRestaurant=${storeId}`;
+function roundMoney(value) {
+  const n = Number(value || 0);
+  if (typeof round2 === 'function') return round2(n);
+  return Math.round(n * 100) / 100;
 }
 
-function cookieHeaderToPlaywright(header = '', domains = ['.ubereats.com']) {
-  const pairs = String(header || '').split(';').map(x => x.trim()).filter(Boolean);
-  const cookies = [];
-  for (const pair of pairs) {
-    const idx = pair.indexOf('=');
-    if (idx <= 0) continue;
-    const name = pair.slice(0, idx).trim();
-    const value = pair.slice(idx + 1).trim();
-    if (!name || /^(path|domain|expires|max-age|secure|httponly|samesite)$/i.test(name)) continue;
-    for (const domain of domains) cookies.push({ name, value, domain, path: '/', httpOnly: false, secure: true, sameSite: 'Lax' });
-  }
-  return cookies;
+function bestMoney(current, candidate) {
+  if (!Number.isFinite(candidate)) return current;
+  if (!Number.isFinite(current)) return candidate;
+  return Math.max(current, candidate);
 }
 
-async function fetchText(fetchImpl, url, headers, timeoutMs) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const res = await fetchImpl(url, { headers, redirect: 'follow', signal: controller.signal });
-    const text = await res.text();
-    if (!res.ok) throw new Error(`HTTP ${res.status} from Uber: ${text.slice(0, 180)}`);
-    if (/sign in|login|authenticate/i.test(text.slice(0, 1500))) throw new Error('Uber returned a login/authentication page. Refresh UBER_COOKIE.');
-    return text;
-  } finally {
-    clearTimeout(timer);
-  }
+function bestCount(current, candidate) {
+  if (!Number.isFinite(candidate)) return current;
+  if (!Number.isFinite(current)) return candidate;
+  if (candidate > 0 && candidate < 10000) return Math.max(current, candidate);
+  return current;
 }
 
-function scrubUrl(url) { try { const u = new URL(url); return `${u.origin}${u.pathname}${u.search}`; } catch { return cleanText(url); } }
-function userAgent() { return 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 FredaOpsCockpit/0.2.32 Safari/537.36'; }
+function truthy(value) {
+  return String(value ?? '').toLowerCase() === 'true' || String(value ?? '') === '1' || String(value ?? '').toLowerCase() === 'yes';
+}
